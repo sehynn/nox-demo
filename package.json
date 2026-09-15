@@ -1,0 +1,12 @@
+{
+  "name": "nox-demo-string-utils",
+  "version": "0.1.0",
+  "description": "Tiny string-utils package used as a live demo target for the Nox skill.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
