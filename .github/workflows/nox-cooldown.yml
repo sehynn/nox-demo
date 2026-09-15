@@ -1,0 +1,88 @@
+# Nox Cooldown -- a required-status-check backstop for solo maintainers.
+#
+# GitHub blocks an account from approving its own PR, unconditionally, with
+# no setting to change it -- so "require approvals" branch protection (the
+# multi-reviewer backstop documented in SKILL.md's "Structural backstop"
+# section) does not work for a solo maintainer running Nox under their own
+# account: the required approval can never come, so it bricks merging
+# instead of gating it.
+#
+# This is a different kind of gate: not approval-based, so the self-approval
+# block never applies. It sets a required status check that only turns
+# green once at least COOLDOWN_HOURS have passed since the PR was opened.
+# Wire it into branch protection as a required check and GitHub enforces it
+# the same way it enforces "CI must pass" -- synchronously, on every merge
+# path (UI, `gh pr merge`, REST, GraphQL), not reactively after the fact.
+#
+# What this does and doesn't do:
+# - Stops an unattended session (bug, misconfiguration, prompt injection)
+#   from merging its own just-opened PR before a human has had a chance to
+#   see it.
+# - Does NOT stop a human (or an agent with admin-level credentials) who is
+#   willing to wait out the cooldown, or who disables branch protection
+#   first. It's a backstop against *accidental* immediate self-merge, not a
+#   defense against a deliberately cooperating repo admin.
+# - Only works if "Do not allow bypassing the above settings" is enabled on
+#   the required-check rule (include administrators) -- without that, the
+#   repo owner's own admin rights bypass it for free.
+# - Only works if the credential Nox's session runs with does NOT have
+#   permission to edit branch protection itself. If it does, it can just
+#   turn the rule off. This file can't enforce that -- it's a separate
+#   recommendation: don't give an unattended session an admin-scoped token.
+
+name: Nox Cooldown
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  schedule:
+    # Re-evaluates all open PRs periodically so the check actually flips to
+    # success once enough time has passed -- a status check does not update
+    # itself just because a clock ticked; something has to call the API.
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  pull-requests: read
+  statuses: write
+
+jobs:
+  cooldown:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate cooldown for open PRs
+        uses: actions/github-script@v7
+        env:
+          COOLDOWN_HOURS: ${{ vars.NOX_COOLDOWN_HOURS || '4' }}
+        with:
+          script: |
+            const cooldownMs = Number(process.env.COOLDOWN_HOURS) * 60 * 60 * 1000;
+            const { owner, repo } = context.repo;
+
+            let prs;
+            if (context.eventName === 'pull_request') {
+              prs = [context.payload.pull_request];
+            } else {
+              const resp = await github.rest.pulls.list({ owner, repo, state: 'open', per_page: 100 });
+              prs = resp.data;
+            }
+
+            for (const pr of prs) {
+              const openedAt = new Date(pr.created_at).getTime();
+              const elapsed = Date.now() - openedAt;
+              const ready = elapsed >= cooldownMs;
+              const remainingMin = Math.max(0, Math.ceil((cooldownMs - elapsed) / 60000));
+
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha: pr.head.sha,
+                state: ready ? 'success' : 'pending',
+                context: 'nox-cooldown',
+                description: ready
+                  ? `Cooldown elapsed (${process.env.COOLDOWN_HOURS}h) -- eligible to merge`
+                  : `${remainingMin}m remaining before this can merge`,
+              });
+
+              console.log(`PR #${pr.number}: ${ready ? 'READY' : `${remainingMin}m remaining`}`);
+            }
